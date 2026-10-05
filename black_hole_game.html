@@ -1,0 +1,528 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+               font-family: system-ui, "Microsoft JhengHei", "PingFang TC", sans-serif; }
+  #game { position: relative; width: 100%; height: 100%; cursor: crosshair; user-select: none; }
+  canvas { display: block; }
+  #hud { position: absolute; top: 12px; left: 16px; color: #cfe8ff; font-size: 14px;
+         pointer-events: none; text-shadow: 0 0 6px #08f; }
+  #hud b { color: #fff; font-size: 20px; margin: 0 18px 0 6px; }
+  #hint { position: absolute; bottom: 12px; width: 100%; text-align: center;
+          color: #7a8ca8; font-size: 13px; pointer-events: none; }
+  .msg { position: absolute; transform: translate(-50%, -100%); width: max-content; max-width: 240px;
+         padding: 4px 8px; border: 1px solid rgba(255, 120, 90, .7); border-radius: 4px;
+         background: rgba(40, 0, 0, .65); color: #ffd8cc; font-size: 12px; line-height: 1.35;
+         pointer-events: none; transition: opacity .4s; }
+  .msg small { display: block; color: #ff8a65; font-size: 10px; letter-spacing: 1px; }
+  .float { position: absolute; transform: translate(-50%, -50%); color: #8dffb0; font-weight: bold;
+           font-size: 15px; pointer-events: none; text-shadow: 0 0 8px #0f6; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<!-- Bloom (glow) post-processing from the three.js examples -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+</head>
+<body>
+<div id="game"><div id="hud"></div><div id="hint"></div></div>
+
+<!-- streamlit_app.py replaces __CONFIG__ with the Gemini distress calls and the HUD text -->
+<script type="application/json" id="config">__CONFIG__</script>
+
+<script>
+// ---------- Config (falls back to built-in text when the page is opened on its own) ----------
+let CONFIG = {
+  messages: ["Mayday! Engines can't escape the pull!", "Hull is buckling, please help!",
+             "Gravity off the charts, need rescue!", "Anyone out there? We're falling!"],
+  text: { rescued: "Crew rescued", lost: "Ships lost", crew: "crew", hint: "Click a ship to launch its escape pods" },
+};
+try { Object.assign(CONFIG, JSON.parse(document.getElementById("config").textContent)); } catch (e) {}
+const T = CONFIG.text;
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+function randomDirection() {   // uniform random unit vector
+  const z = rand(-1, 1), a = rand(0, Math.PI * 2), s = Math.sqrt(1 - z * z);
+  return new THREE.Vector3(Math.cos(a) * s, Math.sin(a) * s, z);
+}
+
+// ---------- Scene ----------
+const container = document.getElementById("game");
+const hud = document.getElementById("hud");
+document.getElementById("hint").textContent = T.hint;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));   // the ray tracer runs per pixel, so cap the resolution
+container.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 300);
+// Almost edge-on, slightly rolled view of the disk (like Gargantua in Interstellar)
+const ELEVATION = 0.15;
+camera.position.set(0, -17 * Math.cos(ELEVATION), 17 * Math.sin(ELEVATION));
+const ROLL = 0.17;
+camera.up.set(Math.sin(ROLL), 0, Math.cos(ROLL));
+camera.lookAt(0, 0, 0);
+
+// Bloom makes the bright parts of the disk and the explosions glow; skipped if the scripts failed to load
+const composer = THREE.UnrealBloomPass ? new THREE.EffectComposer(renderer) : null;
+let bloom = null;
+if (composer) {
+  composer.addPass(new THREE.RenderPass(scene, camera));
+  bloom = new THREE.UnrealBloomPass(new THREE.Vector2(1, 1), 0.7, 0.5, 0.7);   // strength, radius, threshold
+  composer.addPass(bloom);
+}
+
+function resize() {
+  const w = container.clientWidth, h = container.clientHeight;
+  renderer.setSize(w, h);
+  if (composer) composer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(container);
+resize();
+
+// A soft round dot, so every particle glows instead of being a square pixel
+function makeDotTexture() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const g = c.getContext("2d");
+  const grd = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grd.addColorStop(0, "rgba(255,255,255,1)");
+  grd.addColorStop(0.25, "rgba(255,255,255,0.8)");
+  grd.addColorStop(1, "rgba(255,255,255,0)");
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+const DOT = makeDotTexture();
+function particleMaterial(size, extra) {
+  return new THREE.PointsMaterial(Object.assign({
+    size, map: DOT, vertexColors: true, transparent: true,
+    depthWrite: false, blending: THREE.AdditiveBlending,
+  }, extra));
+}
+function pointCloud(positions, colors, material) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  return new THREE.Points(geo, material);
+}
+
+// ---------- Black hole ----------
+const RS = 0.5;               // Schwarzschild radius (world units) used by the ray tracer
+const HORIZON = 2.6 * RS;     // radius of the black "shadow" you see on screen
+const DISK_IN = 3 * RS, DISK_OUT = 15 * RS;
+const GM = 20;                // strength of gravity for ships and debris
+
+// Ray tracer: every pixel shoots a light ray backwards from the camera and bends it around the hole,
+// step by step. Where it crosses the disk plane it picks up the disk's light; if it falls in, it stays black.
+// That bending is what draws the far side of the disk as arcs above and below the hole.
+const blackHoleMaterial = new THREE.ShaderMaterial({
+  depthWrite: false,
+  uniforms: {
+    uTime: { value: 0 }, uRs: { value: RS }, uRin: { value: DISK_IN / RS }, uRout: { value: DISK_OUT / RS },
+    uCamPos: { value: new THREE.Vector3() }, uCamWorld: { value: new THREE.Matrix4() }, uProjInv: { value: new THREE.Matrix4() },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 1.0, 1.0); }   // full screen, at the far plane
+  `,
+  fragmentShader: `
+    precision highp float;
+    uniform float uTime, uRs, uRin, uRout;
+    uniform vec3 uCamPos;
+    uniform mat4 uCamWorld, uProjInv;
+    varying vec2 vUv;
+
+    float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+    float noise(vec3 x) {
+      vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+                 mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+    }
+    float fbm(vec3 p) { float v = 0.0, a = 0.5; for (int i = 0; i < 5; i++) { v += a * noise(p); p *= 2.03; a *= 0.5; } return v; }
+
+    vec3 starfield(vec3 d) {
+      vec3 col = vec3(0.0);
+      for (int layer = 0; layer < 2; layer++) {
+        float scale = layer == 0 ? 120.0 : 300.0;
+        vec3 c = floor(d * scale), f = fract(d * scale) - 0.5;
+        float h = hash(c);
+        if (h > 0.982) {
+          vec3 off = (vec3(hash(c + 3.1), hash(c + 7.7), hash(c + 1.3)) - 0.5) * 0.5;
+          float b = smoothstep(0.22, 0.0, length(f - off)) * (h - 0.982) / 0.018;
+          col += b * mix(vec3(1.0, 0.85, 0.7), vec3(0.75, 0.85, 1.0), hash(c + 5.0)) * (layer == 0 ? 1.3 : 0.7);
+        }
+      }
+      return col + vec3(0.06, 0.035, 0.02) * pow(fbm(d * 2.5), 3.0);   // faint dusty haze
+    }
+
+    // Light from the disk at one point; dir is the ray's direction (backwards in time)
+    vec4 diskSample(vec3 p, vec3 dir) {
+      float r = length(p.xy);
+      if (r < uRin || r > uRout) return vec4(0.0);
+      float phi = atan(p.y, p.x) - uTime * 2.4 * pow(r * uRs, -1.5);   // inner rings spin faster
+      vec3 q = vec3(cos(phi) * 2.6, sin(phi) * 2.6, r * 3.2);           // stretched noise -> long swirling streaks
+      float n = fbm(q) * 0.75 + fbm(q * 3.1 + 7.0) * 0.45;
+      float edge = smoothstep(uRin, uRin + 0.6, r) * (1.0 - smoothstep(uRout * 0.45, uRout, r));
+      float density = edge * clamp(n * 1.25 - 0.18, 0.0, 1.0);
+
+      float temp = pow(uRin / r, 0.85);   // hotter towards the centre
+      vec3 color = mix(vec3(0.85, 0.32, 0.08), vec3(1.0, 0.78, 0.5), temp);
+      color = mix(color, vec3(1.0, 0.96, 0.9), temp * temp);
+
+      // Doppler beaming: the side spinning towards the camera is brighter and bluer
+      vec3 orbit = normalize(vec3(-p.y, p.x, 0.0));
+      float beta = min(0.6 * sqrt(0.5 / max(r - 1.0, 0.3)), 0.75);
+      float D = sqrt(1.0 - beta * beta) / (1.0 - beta * dot(orbit, -dir));
+      float g = sqrt(max(1.0 - 1.0 / r, 0.0));   // gravitational redshift near the horizon
+      float boost = pow(D * g, 3.0);
+      color *= mix(vec3(1.25, 0.8, 0.6), vec3(0.9, 1.0, 1.15), clamp(D - 0.6, 0.0, 1.0));
+
+      return vec4(color * boost * (0.6 + 3.2 * temp) * density, clamp(density * 2.6, 0.0, 1.0));
+    }
+
+    vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+
+    void main() {
+      vec4 view = uProjInv * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+      vec3 dir = normalize((uCamWorld * vec4(view.xyz / view.w, 0.0)).xyz);
+
+      vec3 pos = uCamPos / uRs, vel = dir;   // work in units of the Schwarzschild radius
+      float h2 = dot(cross(pos, vel), cross(pos, vel));
+      vec3 col = vec3(0.0);
+      float alpha = 0.0;
+      bool captured = false;
+
+      for (int i = 0; i < 320; i++) {
+        float r = length(pos);
+        float dt = clamp(0.07 * r, 0.015, 1.4);                  // small steps near the hole, big steps far away
+        vel += -1.5 * h2 * pos / pow(r, 5.0) * dt;               // light bending (Schwarzschild geodesic)
+        vec3 prev = pos;
+        pos += vel * dt;
+        if (prev.z * pos.z < 0.0) {                               // crossed the disk plane
+          vec4 s = diskSample(mix(prev, pos, prev.z / (prev.z - pos.z)), normalize(vel));
+          col += (1.0 - alpha) * s.rgb;
+          alpha += (1.0 - alpha) * s.a;
+        }
+        float rn = length(pos);
+        if (rn < 1.0) { captured = true; break; }
+        if (alpha > 0.98 || (rn > 70.0 && dot(pos, vel) > 0.0)) break;
+      }
+      if (!captured) col += (1.0 - alpha) * starfield(normalize(vel));
+      gl_FragColor = vec4(aces(col * 1.1), 1.0);
+    }
+  `,
+});
+const blackHole = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), blackHoleMaterial);
+blackHole.frustumCulled = false;
+blackHole.renderOrder = -1;
+scene.add(blackHole);
+
+// Invisible sphere that only writes depth, so particles behind the hole are hidden
+const occluder = new THREE.Mesh(new THREE.SphereGeometry(HORIZON, 48, 48), new THREE.MeshBasicMaterial({ colorWrite: false }));
+scene.add(occluder);
+
+camera.updateMatrixWorld();
+blackHoleMaterial.uniforms.uCamPos.value.copy(camera.position);
+
+// Glittering dust in the disk: each particle orbits faster the closer it is (Kepler: w ~ r^-1.5)
+const DISK_N = 3500;
+const disk = (() => {
+  const pos = [], col = [], r = new Float32Array(DISK_N), a = new Float32Array(DISK_N);
+  const hot = new THREE.Color(1, 0.9, 0.7), cool = new THREE.Color(0.7, 0.25, 0.06);
+  for (let i = 0; i < DISK_N; i++) {
+    r[i] = DISK_IN + 0.1 + Math.pow(Math.random(), 1.5) * (DISK_OUT - DISK_IN) * 0.8;
+    a[i] = Math.random() * Math.PI * 2;
+    pos.push(0, 0, (Math.random() - 0.5) * 0.05 * r[i]);
+    const c = hot.clone().lerp(cool, (r[i] - DISK_IN) / (DISK_OUT - DISK_IN)).multiplyScalar(rand(0.2, 0.7));
+    col.push(c.r, c.g, c.b);
+  }
+  const points = pointCloud(pos, col, particleMaterial(0.05));
+  points.userData = { r, a };
+  return points;
+})();
+scene.add(disk);
+
+// The ships fly on their own plane, tilted towards the camera so they stay easy to see and click.
+// Everything in the game (ships, pods, explosions) lives inside this group, in its local x-y plane.
+const gameRoot = new THREE.Group();
+gameRoot.rotation.x = 0.85;
+scene.add(gameRoot);
+gameRoot.updateMatrixWorld();
+
+function updateDisk(dt) {
+  blackHoleMaterial.uniforms.uTime.value += dt;
+  const { r, a } = disk.userData;
+  const p = disk.geometry.attributes.position.array;
+  for (let i = 0; i < DISK_N; i++) {
+    a[i] += dt * 2.4 * Math.pow(r[i], -1.5);
+    p[i * 3] = Math.cos(a[i]) * r[i];
+    p[i * 3 + 1] = Math.sin(a[i]) * r[i];
+  }
+  disk.geometry.attributes.position.needsUpdate = true;
+}
+
+// ---------- Effect particles (explosions, debris, pod trails) ----------
+const FX_N = 12000;
+const fx = {
+  pos: new Float32Array(FX_N * 3), vel: new Float32Array(FX_N * 3), base: new Float32Array(FX_N * 3),
+  life: new Float32Array(FX_N), maxLife: new Float32Array(FX_N), grav: new Float32Array(FX_N),
+  next: 0,
+};
+const fxGeo = new THREE.BufferGeometry();
+fxGeo.setAttribute("position", new THREE.BufferAttribute(fx.pos, 3));
+fxGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(FX_N * 3), 3));
+gameRoot.add(new THREE.Points(fxGeo, particleMaterial(0.16)));
+
+function emit(x, y, z, vx, vy, vz, color, life, grav) {
+  const i = fx.next;
+  fx.next = (fx.next + 1) % FX_N;   // ring buffer: the oldest particle is reused
+  fx.pos.set([x, y, z], i * 3);
+  fx.vel.set([vx, vy, vz], i * 3);
+  fx.base.set([color.r, color.g, color.b], i * 3);
+  fx.life[i] = fx.maxLife[i] = life;
+  fx.grav[i] = grav;
+}
+
+function updateFx(dt) {
+  const col = fxGeo.attributes.color.array;
+  for (let i = 0; i < FX_N; i++) {
+    if (fx.life[i] <= 0) continue;
+    const k = i * 3;
+    let x = fx.pos[k], y = fx.pos[k + 1], z = fx.pos[k + 2];
+    const r = Math.hypot(x, y, z);
+    if (fx.grav[i] > 0) {
+      const acc = GM * fx.grav[i] / (r * r + 0.05);
+      fx.vel[k] -= x / r * acc * dt; fx.vel[k + 1] -= y / r * acc * dt; fx.vel[k + 2] -= z / r * acc * dt;
+    }
+    x += fx.vel[k] * dt; y += fx.vel[k + 1] * dt; z += fx.vel[k + 2] * dt;
+    fx.pos[k] = x; fx.pos[k + 1] = y; fx.pos[k + 2] = z;
+    fx.life[i] -= dt;
+    if (fx.grav[i] > 0 && r < HORIZON) fx.life[i] = 0;   // swallowed by the black hole
+    let fade = Math.max(fx.life[i], 0) / fx.maxLife[i];
+    if (fx.grav[i] > 0) fade = Math.min(1, fade * 3) * Math.min(1, (r - HORIZON) / 1.5);  // dims near the horizon
+    col[k] = fx.base[k] * fade; col[k + 1] = fx.base[k + 1] * fade; col[k + 2] = fx.base[k + 2] * fade;
+  }
+  fxGeo.attributes.position.needsUpdate = true;
+  fxGeo.attributes.color.needsUpdate = true;
+}
+
+function explode(pos, count, speed, colors, life, grav, swirl) {
+  for (let n = 0; n < count; n++) {
+    const v = randomDirection().multiplyScalar(rand(0.3, 1) * speed);
+    if (swirl) {  // add sideways speed so the debris spirals in instead of falling straight
+      const t = new THREE.Vector3(-pos.y, pos.x, 0).normalize().multiplyScalar(swirl);
+      v.add(t);
+    }
+    const c = pick(colors).clone().multiplyScalar(rand(0.6, 1.2));
+    emit(pos.x, pos.y, pos.z, v.x, v.y, v.z, c, rand(0.6, 1) * life, grav);
+  }
+}
+
+// ---------- Ships ----------
+// One shared particle shape for every ship, pointing along +x
+const shipGeo = (() => {
+  const pos = [], col = [];
+  for (let i = 0; i < 160; i++) {   // triangular hull
+    let u = Math.random(), v = Math.random();
+    if (u + v > 1) { u = 1 - u; v = 1 - v; }
+    const x = 0.45 + u * (-0.75) + v * (-0.75), y = u * 0.28 + v * (-0.28);
+    pos.push(x, y, rand(-0.04, 0.04));
+    const b = rand(0.5, 1);
+    col.push(0.55 * b, 0.85 * b, 1 * b);
+  }
+  for (let i = 0; i < 40; i++) {    // engine glow at the back
+    pos.push(rand(-0.42, -0.3), rand(-0.12, 0.12), 0);
+    col.push(1, rand(0.4, 0.7), 0.15);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  return g;
+})();
+
+const NAMES = ["Aurora", "Kestrel", "Odyssey", "Halcyon", "Vega", "Nomad", "Zephyr", "Atlas", "Lumen", "Orion", "Tycho", "Meridian"];
+const ships = [];
+const SPAWN_R = 11.5, MAX_SHIPS = 10;
+
+function spawnShip() {
+  const obj = new THREE.Points(shipGeo, particleMaterial(0.13));
+  obj.scale.setScalar(1.5);
+  gameRoot.add(obj);
+  ships.push({
+    obj, r: rand(SPAWN_R - 1, SPAWN_R + 1), theta: Math.random() * Math.PI * 2,
+    dir: Math.random() < 0.5 ? 1 : -1, speed: rand(0.8, 1.25), wobble: Math.random() * 10,
+    crew: 1 + Math.floor(Math.random() * 5),
+    name: `${pick(NAMES)}-${10 + Math.floor(Math.random() * 90)}`,
+    nextMsg: clockTime + rand(0.5, 3), msg: null, msgUntil: 0,
+  });
+}
+
+function removeShip(s) {
+  gameRoot.remove(s.obj);
+  s.obj.material.dispose();
+  if (s.msg) s.msg.remove();
+  ships.splice(ships.indexOf(s), 1);
+}
+
+function updateShips(dt) {
+  for (const s of [...ships]) {
+    // Spiral in: orbit around the hole while the radius keeps shrinking, faster near the centre
+    const omega = s.dir * 0.9 * Math.sqrt(GM / (s.r ** 3));
+    const dr = -(0.35 + 2.6 / s.r) * s.speed * difficulty;
+    s.theta += omega * dt;
+    s.r += dr * dt;
+    const c = Math.cos(s.theta), sn = Math.sin(s.theta);
+    s.obj.position.set(c * s.r, sn * s.r, 0.25 * Math.sin(clockTime * 1.5 + s.wobble));
+    s.obj.rotation.z = Math.atan2(sn * dr + c * s.r * omega, c * dr - sn * s.r * omega);  // face the direction of travel
+
+    // Glow red as the ship gets dangerously close
+    const danger = THREE.MathUtils.clamp((5 - s.r) / 3.5, 0, 1);
+    s.obj.material.color.setRGB(1, 1 - danger * 0.8, 1 - danger * 0.85);
+
+    if (s.r < HORIZON + 0.45) { shipLost(s); continue; }
+    updateMessage(s);
+  }
+}
+
+// ---------- Distress calls (written by Gemini) ----------
+let deck = [];
+function nextMessage() {   // shuffled deck, so calls don't repeat until all have been used
+  if (!deck.length) deck = [...CONFIG.messages].sort(() => Math.random() - 0.5);
+  return deck.pop();
+}
+
+function updateMessage(s) {
+  if (!s.msg && clockTime >= s.nextMsg && container.querySelectorAll(".msg").length < 4) {
+    s.msg = document.createElement("div");
+    s.msg.className = "msg";
+    const name = document.createElement("small");
+    name.textContent = `${s.name} · ${s.crew} ${T.crew}`;
+    s.msg.append(name, document.createTextNode(nextMessage()));   // text, never HTML, so model output is safe
+    container.append(s.msg);
+    s.msgUntil = clockTime + 3.2;
+  }
+  if (!s.msg) return;
+  const p = toScreen(s.obj.position);
+  const half = s.msg.offsetWidth / 2 + 4;   // keep the bubble inside the screen
+  s.msg.style.left = `${THREE.MathUtils.clamp(p.x, half, container.clientWidth - half)}px`;
+  s.msg.style.top = `${p.y - 14}px`;
+  if (clockTime > s.msgUntil) {
+    const el = s.msg;
+    el.style.opacity = 0;
+    setTimeout(() => el.remove(), 400);
+    s.msg = null;
+    s.nextMsg = clockTime + rand(4, 8);
+  }
+}
+
+// ---------- Rescue & loss ----------
+const pods = [];
+let rescued = 0, lost = 0;
+const GREEN = new THREE.Color(0.4, 1, 0.6), WHITE = new THREE.Color(1, 1, 1), CYAN = new THREE.Color(0.4, 0.8, 1),
+      ORANGE = new THREE.Color(1, 0.55, 0.15), RED = new THREE.Color(1, 0.2, 0.08), YELLOW = new THREE.Color(1, 0.9, 0.4);
+
+function rescue(s) {
+  const pos = s.obj.position.clone();
+  const out = new THREE.Vector2(pos.x, pos.y).normalize();   // away from the black hole
+  const podCount = Math.min(3, s.crew);
+  for (let i = 0; i < podCount; i++) {
+    const ang = Math.atan2(out.y, out.x) + rand(-0.35, 0.35);
+    const speed = rand(6, 8);
+    pods.push({ pos: pos.clone(), vel: new THREE.Vector3(Math.cos(ang) * speed, Math.sin(ang) * speed, rand(-0.5, 1)), age: 0 });
+  }
+  rescued += s.crew;
+  floatText(pos, `+${s.crew} 👨‍🚀`);
+  removeShip(s);
+  // The empty ship blows up a moment after the pods are clear
+  setTimeout(() => explode(pos, 260, 4, [WHITE, CYAN, YELLOW], 1.4, 0.15, 0), 250);
+}
+
+function shipLost(s) {
+  const pos = s.obj.position.clone();
+  lost += 1;
+  removeShip(s);
+  explode(pos, 220, 2.5, [ORANGE, RED, YELLOW], 1.2, 0, 0);   // flash
+  explode(pos, 350, 1.2, [ORANGE, RED, CYAN], 9, 1, 2.2);      // debris pulled into the hole
+}
+
+function updatePods(dt) {
+  for (const p of [...pods]) {
+    p.age += dt;
+    p.pos.addScaledVector(p.vel, dt);
+    for (let n = 0; n < 4; n++) {   // bright head plus a fading trail
+      emit(p.pos.x + rand(-0.05, 0.05), p.pos.y + rand(-0.05, 0.05), p.pos.z, rand(-0.2, 0.2), rand(-0.2, 0.2), 0,
+           n === 0 ? WHITE : GREEN, n === 0 ? 0.12 : 0.6, 0);
+    }
+    if (p.age > 4) pods.splice(pods.indexOf(p), 1);
+  }
+}
+
+function floatText(pos, text) {
+  const el = document.createElement("div");
+  el.className = "float";
+  el.textContent = text;
+  const p = toScreen(pos);
+  el.style.left = `${p.x}px`;
+  el.style.top = `${p.y}px`;
+  container.append(el);
+  el.animate([{ transform: "translate(-50%,-50%)", opacity: 1 }, { transform: "translate(-50%,-250%)", opacity: 0 }],
+             { duration: 1300, easing: "ease-out" }).onfinish = () => el.remove();
+}
+
+// ---------- Input ----------
+function toScreen(v) {   // v is a position inside gameRoot
+  const p = gameRoot.localToWorld(v.clone()).project(camera);
+  return { x: (p.x + 1) / 2 * container.clientWidth, y: (1 - p.y) / 2 * container.clientHeight };
+}
+
+renderer.domElement.addEventListener("pointerdown", (e) => {
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  let best = null, bestD = 30;   // click tolerance in pixels
+  for (const s of ships) {
+    const p = toScreen(s.obj.position);
+    const d = Math.hypot(p.x - mx, p.y - my);
+    if (d < bestD) { best = s; bestD = d; }
+  }
+  if (best) rescue(best);
+});
+
+// ---------- Main loop ----------
+const clock = new THREE.Clock();
+let clockTime = 0, nextSpawn = 0.5, difficulty = 1;
+
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  clockTime += dt;
+  difficulty = Math.min(1 + clockTime / 120, 2.2);   // ships fall faster as time goes on
+
+  if (clockTime > nextSpawn && ships.length < MAX_SHIPS) {
+    spawnShip();
+    nextSpawn = clockTime + rand(1.6, 3.6) / difficulty;
+  }
+
+  updateDisk(dt);
+  updateShips(dt);
+  updatePods(dt);
+  updateFx(dt);
+
+  hud.innerHTML = `${T.rescued}<b>${rescued}</b>${T.lost}<b>${lost}</b>`;
+  blackHoleMaterial.uniforms.uCamWorld.value.copy(camera.matrixWorld);
+  blackHoleMaterial.uniforms.uProjInv.value.copy(camera.projectionMatrixInverse);
+  if (composer) composer.render(); else renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+frame();
+</script>
+</body>
+</html>

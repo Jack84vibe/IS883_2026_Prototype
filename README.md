@@ -4,7 +4,7 @@ This repository contains three separate Streamlit apps. Streamlit Community Clou
 
 | App | Main file path | What it does | Needs the Gemini key? |
 | --- | --- | --- | --- |
-| Hello button | `streamlit_app.py` | Asks Gemini to say hello when you press a button | Yes |
+| Black hole rescue game | `streamlit_app.py` | A 3D particle game: click ships to save their crews before they fall into a black hole. Gemini writes the ships' distress calls. Keep `black_hole_game.html` next to it. | Yes |
 | Chatbot | `chatbot_app.py` | A Gemini chat that remembers the conversation | Yes |
 | Llama hello button | `llama_demo/streamlit_app_llama.py` | The same hello button, but the model (Llama 3.2 1B, about 0.8 GB) runs **inside the app** | No |
 
